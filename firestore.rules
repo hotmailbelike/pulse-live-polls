@@ -1,0 +1,77 @@
+rules_version = '2';
+
+// Pulse has no sign-in: anyone with a poll link may read it and vote once per
+// device. Everything not matched below is denied, and nothing can be updated,
+// deleted or listed at the poll level.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidOption(option) {
+      return option is string
+        && option.trim().size() >= 1
+        && option.size() <= 60;
+    }
+
+    // Rules have no loops, so each optional slot (2 to 5) is checked only when present.
+    function hasValidOptions(options) {
+      return options is list
+        && options.size() >= 2
+        && options.size() <= 6
+        && isValidOption(options[0])
+        && isValidOption(options[1])
+        && (options.size() < 3 || isValidOption(options[2]))
+        && (options.size() < 4 || isValidOption(options[3]))
+        && (options.size() < 5 || isValidOption(options[4]))
+        && (options.size() < 6 || isValidOption(options[5]));
+    }
+
+    function isValidNewPoll(data) {
+      return data.keys().hasOnly(['question', 'options', 'createdAt', 'closesAt'])
+        && data.keys().hasAll(['question', 'options', 'createdAt', 'closesAt'])
+        && data.question is string
+        && data.question.trim().size() >= 1
+        && data.question.size() <= 140
+        && hasValidOptions(data.options)
+        && data.createdAt == request.time
+        && data.closesAt is timestamp
+        && data.closesAt > request.time
+        && data.closesAt <= request.time + duration.value(24, 'h');
+    }
+
+    function isValidVoterId(voterId) {
+      return voterId.size() >= 20
+        && voterId.size() <= 40
+        && voterId.matches('^[A-Za-z0-9_-]+$');
+    }
+
+    function isValidNewVote(pollId, data) {
+      let poll = get(/databases/$(database)/documents/polls/$(pollId)).data;
+      return data.keys().hasOnly(['option', 'createdAt'])
+        && data.keys().hasAll(['option', 'createdAt'])
+        && data.option is int
+        && data.option >= 0
+        && data.option < poll.options.size()
+        && data.createdAt == request.time
+        && request.time < poll.closesAt;
+    }
+
+    // The app creates polls with addDoc, which gives 20-character auto ids. Requiring that shape
+    // stops anyone from claiming chosen ids such as polls/admin as vanity links.
+    function isAutoId(id) {
+      return id.matches('^[A-Za-z0-9]{20}$');
+    }
+
+    match /polls/{pollId} {
+      allow get: if true;
+      allow create: if isAutoId(pollId) && isValidNewPoll(request.resource.data);
+
+      // The vote document id is the device's voterId, so a second vote from the
+      // same device would be an update, which is denied.
+      match /votes/{voterId} {
+        allow get, list: if true;
+        allow create: if isValidVoterId(voterId)
+          && isValidNewVote(pollId, request.resource.data);
+      }
+    }
+  }
+}
